@@ -1,0 +1,4 @@
+conda activate myenv
+export PYTHONPATH=$(pwd)
+tmux a -t training
+python train.py | tee train.log 
