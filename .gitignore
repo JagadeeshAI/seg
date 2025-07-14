@@ -24,3 +24,5 @@ Thumbs.db
 # Ignore Git directories inside cloned repositories if you want to treat them as regular folders
 **/.git
 *.pth
+
+./pkgs
