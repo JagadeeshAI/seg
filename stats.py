@@ -6,6 +6,9 @@ from tabulate import tabulate
 from thop import profile
 from tqdm import tqdm
 import warnings
+import numpy as np
+from PIL import Image
+import torchvision.transforms as transforms
 
 from data import get_dataloaders
 from config import MODEL
@@ -158,6 +161,111 @@ def measure_fps(model, dataloader, model_type, max_batches=10):
     else:
         return 0.0
 
+def save_predictions(model, dataloader, model_type, save_dir="results"):
+    """Save model predictions and organize results"""
+    model.eval()
+    
+    # Create directories
+    rgb_dir = os.path.join(save_dir, "RGB")
+    true_mask_dir = os.path.join(save_dir, "true_mask")
+    pred_dir = os.path.join(save_dir, model_type)
+    
+    os.makedirs(rgb_dir, exist_ok=True)
+    os.makedirs(true_mask_dir, exist_ok=True)
+    os.makedirs(pred_dir, exist_ok=True)
+    
+    print(f"Saving predictions for {model_type.upper()}...")
+    
+    with torch.no_grad():
+        for batch_idx, (images, masks, filenames) in enumerate(tqdm(dataloader, desc=f"Saving {model_type} predictions")):
+            images = images.to(DEVICE)
+            masks = masks.to(DEVICE)
+            
+            # Get predictions
+            outputs = model(images)
+            
+            # Handle different output formats
+            if model_type == 'emcad':
+                predictions = torch.sigmoid(outputs[-1])
+            elif model_type == 'ukan':
+                predictions = torch.sigmoid(outputs)
+            else:  # pranetv2
+                if isinstance(outputs, (list, tuple)):
+                    predictions = torch.sigmoid(outputs[-1])
+                else:
+                    predictions = torch.sigmoid(outputs)
+            
+            # Save each image in the batch
+            for i in range(images.shape[0]):
+                filename = filenames[i] if isinstance(filenames[i], str) else f"image_{batch_idx:04d}_{i:02d}"
+                base_name = os.path.splitext(os.path.basename(filename))[0]
+                
+                # Save RGB image (only once for the first model)
+                rgb_path = os.path.join(rgb_dir, f"{base_name}.png")
+                if not os.path.exists(rgb_path):
+                    # Convert tensor to PIL image (images are already in [0,1] range from ToTensor())
+                    rgb_img = images[i].cpu()
+                    rgb_img = transforms.ToPILImage()(rgb_img)
+                    rgb_img.save(rgb_path)
+                
+                # Save true mask (only once for the first model)
+                mask_path = os.path.join(true_mask_dir, f"{base_name}.png")
+                if not os.path.exists(mask_path):
+                    true_mask = (masks[i].cpu().squeeze() * 255).numpy().astype(np.uint8)
+                    Image.fromarray(true_mask, mode='L').save(mask_path)
+                
+                # Save prediction
+                pred_path = os.path.join(pred_dir, f"{base_name}.png")
+                pred_mask = (predictions[i].cpu().squeeze() * 255).numpy().astype(np.uint8)
+                Image.fromarray(pred_mask, mode='L').save(pred_path)
+    """Evaluate model on test data"""
+    all_preds = []
+    all_targets = []
+    total_iou = 0
+    num_samples = 0
+    
+    with torch.no_grad():
+        progress_bar = tqdm(dataloader, desc=f"Evaluating {model_type.upper()}")
+        for images, masks, _ in progress_bar:
+            images = images.to(DEVICE)
+            masks = masks.to(DEVICE)
+            
+            outputs = model(images)
+            
+            # Handle different output formats
+            if model_type == 'emcad':
+                # EMCAD returns [p4, p3, p2, p1], use finest scale
+                predictions = torch.sigmoid(outputs[-1])
+            elif model_type == 'ukan':
+                # U-KAN returns single output
+                predictions = torch.sigmoid(outputs)
+            else:
+                # PraNet-V2 handling
+                if isinstance(outputs, (list, tuple)):
+                    predictions = torch.sigmoid(outputs[-1])
+                else:
+                    predictions = torch.sigmoid(outputs)
+            
+            # Calculate IoU for each sample
+            for i in range(predictions.shape[0]):
+                iou = calculate_iou(predictions[i], masks[i])
+                total_iou += iou
+                num_samples += 1
+            
+            # Flatten for precision/recall/f1
+            pred_flat = (predictions > 0.5).cpu().numpy().flatten()
+            target_flat = (masks > 0.5).cpu().numpy().flatten()
+            
+            all_preds.extend(pred_flat)
+            all_targets.extend(target_flat)
+            
+            progress_bar.set_postfix({"IoU": f"{total_iou/num_samples:.4f}"})
+    
+    precision = precision_score(all_targets, all_preds, zero_division=0)
+    recall = recall_score(all_targets, all_preds, zero_division=0)
+    f1 = f1_score(all_targets, all_preds, zero_division=0)
+    avg_iou = total_iou / num_samples
+    
 def evaluate_model(model, dataloader, model_type):
     """Evaluate model on test data"""
     all_preds = []
@@ -209,6 +317,66 @@ def evaluate_model(model, dataloader, model_type):
     
     return precision, recall, f1, avg_iou
 
+def save_comparison_table(results, test_size, save_path="results/comp.txt"):
+    """Save comparison table to file"""
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    
+    headers = ["Model Name", "Precision", "Recall", "F1 Score", "IoU", "Params (M)", "FLOPs (G)", "FPS", "Test Size"]
+    data = []
+    
+    for result in results:
+        data.append([
+            result['name'],
+            f"{result['precision']:.4f}",
+            f"{result['recall']:.4f}",
+            f"{result['f1']:.4f}",
+            f"{result['iou']:.4f}",
+            f"{result['params_m']:.2f}",
+            f"{result['flops_g']:.2f}" if result['flops_g'] > 0 else "N/A",
+            f"{result['fps']:.2f}",
+            test_size
+        ])
+    
+    # Generate table string
+    table_str = tabulate(data, headers=headers, tablefmt="grid")
+    
+    # Save to file
+    with open(save_path, 'w') as f:
+        f.write("="*120 + "\n")
+        if len(results) > 1:
+            f.write("MODEL COMPARISON RESULTS\n")
+        else:
+            f.write(f"EVALUATION RESULTS FOR {results[0]['name']}\n")
+        f.write("="*120 + "\n")
+        f.write(table_str + "\n\n")
+        
+        # Add detailed breakdown
+        for result in results:
+            f.write(f"Detailed Results for {result['name']}:\n")
+            f.write(f"  • Precision: {result['precision']:.4f}\n")
+            f.write(f"  • Recall: {result['recall']:.4f}\n")
+            f.write(f"  • F1-Score: {result['f1']:.4f}\n")
+            f.write(f"  • IoU: {result['iou']:.4f}\n")
+            f.write(f"  • Parameters: {result['total_params']:,} ({result['params_m']:.2f}M)\n")
+            f.write(f"  • FLOPs: {result['flops']:,} ({result['flops_g']:.2f}G)\n" if result['flops'] > 0 else f"  • FLOPs: Could not calculate\n")
+            f.write(f"  • Inference Speed: {result['fps']:.2f} FPS\n")
+            f.write(f"  • Test Samples: {test_size}\n\n")
+        
+        # Add summary if multiple models
+        if len(results) > 1:
+            best_iou = max(results, key=lambda x: x['iou'])
+            best_fps = max(results, key=lambda x: x['fps'])
+            least_params = min(results, key=lambda x: x['params_m'])
+            
+            f.write("="*60 + "\n")
+            f.write("SUMMARY\n")
+            f.write("="*60 + "\n")
+            f.write(f"Best IoU: {best_iou['name']} ({best_iou['iou']:.4f})\n")
+            f.write(f"Fastest: {best_fps['name']} ({best_fps['fps']:.2f} FPS)\n")
+            f.write(f"Most Efficient: {least_params['name']} ({least_params['params_m']:.2f}M params)\n")
+    
+    print(f"Comparison table saved to {save_path}")
+
 def get_model_display_name(model_type):
     """Get display name for model"""
     if model_type == 'emcad':
@@ -220,13 +388,17 @@ def get_model_display_name(model_type):
     else:
         return model_type.upper()
 
-def evaluate_single_model(model_type, val_loader):
+def evaluate_single_model(model_type, val_loader, save_predictions_flag=True):
     """Evaluate a single model and return results"""
     try:
         print(f"\nEvaluating {get_model_display_name(model_type)}...")
         
         # Load model
         model = load_model(model_type)
+        
+        # Save predictions if requested
+        if save_predictions_flag:
+            save_predictions(model, val_loader, model_type)
         
         print("Calculating performance metrics...")
         # Calculate metrics
@@ -284,7 +456,7 @@ def main():
     # Evaluate models
     results = []
     for mt in model_types:
-        result = evaluate_single_model(mt, val_loader)
+        result = evaluate_single_model(mt, val_loader, save_predictions_flag=True)
         if result:
             results.append(result)
     
@@ -292,7 +464,10 @@ def main():
         print("No models successfully evaluated")
         return
     
-    # Create comparison table
+    # Save comparison table to file
+    save_comparison_table(results, test_size)
+    
+    # Create comparison table for console
     headers = ["Model Name", "Precision", "Recall", "F1 Score", "IoU", "Params (M)", "FLOPs (G)", "FPS", "Test Size"]
     data = []
     
@@ -342,6 +517,13 @@ def main():
         print(f"Best IoU: {best_iou['name']} ({best_iou['iou']:.4f})")
         print(f"Fastest: {best_fps['name']} ({best_fps['fps']:.2f} FPS)")
         print(f"Most Efficient: {least_params['name']} ({least_params['params_m']:.2f}M params)")
+    
+    print(f"\nResults saved in:")
+    print(f"  • Comparison table: results/comp.txt")
+    print(f"  • RGB images: results/RGB/")
+    print(f"  • True masks: results/true_mask/")
+    for mt in model_types:
+        print(f"  • {get_model_display_name(mt)} predictions: results/{mt}/")
 
 if __name__ == "__main__":
     main()

@@ -1,4 +1,4 @@
 # MODEL = 'pranetv2'
 # MODEL = 'EMCAD'
-MODEL = 'UKAN'
-# MODEL = 'all'
+# MODEL = 'UKAN'
+MODEL = 'all'
